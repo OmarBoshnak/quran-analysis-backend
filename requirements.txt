@@ -1,0 +1,22 @@
+# Core API
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9  # Required for File upload handling
+
+# Audio Processing & ASR
+faster-whisper==1.0.3
+
+# Text Processing
+jiwer==3.0.4
+
+# AI/LLM (for child-friendly feedback)
+google-generativeai==0.3.2
+
+# Utilities
+python-dotenv==1.0.1
+pydantic==2.9.2
+
+# Optional: Development/Testing
+# pytest==8.0.0
+# pytest-asyncio==0.23.0
+# httpx==0.26.0

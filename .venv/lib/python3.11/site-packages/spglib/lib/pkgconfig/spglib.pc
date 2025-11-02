@@ -1,0 +1,5 @@
+Name: Spglib
+Description: The spglib library
+Version: 2.6.0
+Libs: -L/var/folders/mj/dx2cc6hn6h9br7vt9hz4n06m0000gn/T/tmpdh_t8fag/wheel/platlib/spglib/lib -lsymspg
+Cflags: -I/var/folders/mj/dx2cc6hn6h9br7vt9hz4n06m0000gn/T/tmpdh_t8fag/wheel/platlib/spglib/include
