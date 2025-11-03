@@ -8,14 +8,15 @@ import os
 import tempfile
 from typing import Optional
 
-from align import tokenize_arabic, wer_and_alignment
-from asr import transcribe_audio
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import (FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from feedback import generate_kid_feedback
 from pydantic import BaseModel, Field
+
+from align import tokenize_arabic, wer_and_alignment
+from asr import transcribe_audio
+from feedback import generate_kid_feedback
 from reciters import build_reciter_url
 from rules import TajweedAnalyzer, detect_tajweed_hints
 
@@ -329,9 +330,9 @@ async def get_tajweed_guide(
 
 @app.get("/recitation", response_model=RecitationURLResponse)
 async def get_recitation_url(
-        surah: int = Field(..., ge=1, le=114, description="Surah number (1-114)"),
-        ayah: int = Field(..., ge=1, description="Ayah number"),
-        reciter_id: int = Field(7, ge=1, description="Reciter ID")
+        surah: int = Query(..., ge=1, le=114, description="Surah number (1-114)"),
+        ayah: int = Query(..., ge=1, description="Ayah number"),
+        reciter_id: int = Query(7, ge=1, description="Reciter ID")
 ):
     """
     Get MP3 URL for a specific Surah and Ayah recitation
