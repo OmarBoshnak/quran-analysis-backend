@@ -1,44 +1,110 @@
 """
 Enhanced FastAPI Backend for Quran Learning App
 Production-ready with comprehensive error handling and validation
+Version: 2.0.0
 """
 
 import logging
 import os
 import tempfile
+import time
+from datetime import datetime
 from typing import Optional
 
-from fastapi import (FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query)
+from cachetools import TTLCache
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    BackgroundTasks,
+    Query,
+    Request,
+    Depends
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from align import tokenize_arabic, wer_and_alignment
 from asr import transcribe_audio
+from config import settings
 from feedback import generate_kid_feedback
+from quran_data import validate_surah_ayah, get_max_ayah
 from reciters import build_reciter_url
 from rules import TajweedAnalyzer, detect_tajweed_hints
+from security import verify_api_key, RateLimitConfig
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+
+# ============ Custom Middleware ============
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Log all HTTP requests with timing"""
+
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+
+        # Log request
+        logger.info(f"→ {request.method} {request.url.path} from {request.client.host}")
+
+        # Process request
+        response = await call_next(request)
+
+        # Calculate duration
+        duration = time.time() - start_time
+
+        # Log response
+        logger.info(
+            f"← {request.method} {request.url.path} "
+            f"[{response.status_code}] {duration:.2f}s"
+        )
+
+        # Add timing header
+        response.headers["X-Process-Time"] = f"{duration:.4f}"
+
+        return response
+
+
+# ============ Initialize FastAPI App ============
+
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(
     title="LittleBeliever Quran Analysis API",
     description="AI-powered Quran recitation analysis with Tajweed guidance",
-    version="2.0.0"
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
+
+# Add rate limiter to app state
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add custom middleware
+app.add_middleware(RequestLoggingMiddleware)
 
 # CORS Configuration
 origins = [
     "http://localhost",
+    "http://localhost:3000",
     "http://127.0.0.1",
     "http://10.0.2.2",  # Android emulator
     "http://localhost:8081",  # React Native Metro
+    "http://localhost:19006",  # Expo web
     # Add your production domain here
 ]
 
@@ -50,12 +116,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Constants
-MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_AUDIO_FORMATS = [".m4a", ".wav", ".mp3", ".aac"]
+# Initialize cache for expensive operations
+tajweed_cache = TTLCache(
+    maxsize=settings.CACHE_MAX_SIZE,
+    ttl=settings.CACHE_TTL_SECONDS
+) if settings.CACHE_ENABLED else None
+
+# Constants from settings
+MAX_AUDIO_SIZE = settings.MAX_AUDIO_SIZE
+ALLOWED_AUDIO_FORMATS = settings.ALLOWED_AUDIO_FORMATS
 
 
-# Response Models
+# ============ Response Models ============
+
 class AnalysisResponse(BaseModel):
     ok: bool
     wer: float = Field(..., ge=0, le=1, description="Word Error Rate")
@@ -85,56 +158,81 @@ class TajweedGuideResponse(BaseModel):
     estimated_duration: int
 
 
+class ValidationRequest(BaseModel):
+    surah: int
+    ayah: int
+
+
+class ValidationResponse(BaseModel):
+    ok: bool
+    valid: bool
+    message: Optional[str] = None
+    max_ayah: Optional[int] = None
+
+
 class ErrorResponse(BaseModel):
     ok: bool = False
     error: str
     detail: Optional[str] = None
 
 
-# Custom Exception Handlers
+class HealthCheckResponse(BaseModel):
+    status: str
+    service: str
+    version: str
+    timestamp: str
+    checks: dict
+
+
+# ============ Custom Exception Handlers ============
+
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc: RequestValidationError):
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors with detailed messages"""
-    logger.error(f"Validation error: {exc}")
+    logger.error(f"Validation error on {request.url.path}: {exc}")
     return JSONResponse(
         status_code=422,
         content={
             "ok": False,
             "error": "Validation failed",
-            "detail": str(exc.errors())
+            "detail": str(exc.errors()),
+            "timestamp": datetime.utcnow().isoformat()
         }
     )
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc: HTTPException):
+async def http_exception_handler(request: Request, exc: HTTPException):
     """Handle HTTP exceptions consistently"""
-    logger.error(f"HTTP exception: {exc.detail}")
+    logger.error(f"HTTP exception on {request.url.path}: {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "ok": False,
             "error": exc.detail,
-            "status_code": exc.status_code
+            "status_code": exc.status_code,
+            "timestamp": datetime.utcnow().isoformat()
         }
     )
 
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc: Exception):
+async def general_exception_handler(request: Request, exc: Exception):
     """Catch-all for unhandled exceptions"""
-    logger.exception(f"Unhandled exception: {str(exc)}")
+    logger.exception(f"Unhandled exception on {request.url.path}: {str(exc)}")
     return JSONResponse(
         status_code=500,
         content={
             "ok": False,
             "error": "Internal server error",
-            "detail": "An unexpected error occurred. Please try again."
+            "detail": "An unexpected error occurred. Please try again.",
+            "timestamp": datetime.utcnow().isoformat()
         }
     )
 
 
-# Utility Functions
+# ============ Utility Functions ============
+
 async def cleanup_temp_file(file_path: str):
     """Background task to clean up temporary files"""
     try:
@@ -166,23 +264,30 @@ def validate_audio_file(file: UploadFile) -> None:
 def validate_arabic_text(text: str) -> None:
     """Validate that text contains Arabic characters"""
     if not text or not text.strip():
-        raise HTTPException(status_code=400, detail="Expected Arabic text cannot be empty")
+        raise HTTPException(
+            status_code=400,
+            detail="Expected Arabic text cannot be empty"
+        )
 
     # Check if contains at least some Arabic characters
     arabic_chars = sum(1 for c in text if '\u0600' <= c <= '\u06FF')
-    if arabic_chars < len(text.strip()) * 0.3:  # At least 30% Arabic
+    if arabic_chars < len(text.strip()) * settings.MIN_ARABIC_RATIO:
         raise HTTPException(
             status_code=400,
-            detail="Text must contain primarily Arabic characters"
+            detail=f"Text must contain primarily Arabic characters (at least {int(settings.MIN_ARABIC_RATIO * 100)}%)"
         )
 
 
-# API Endpoints
+# ============ API Endpoints ============
+
 @app.post("/analyze", response_model=AnalysisResponse)
+@limiter.limit(RateLimitConfig.ANALYZE)
 async def analyze_recitation(
+        request: Request,
         background_tasks: BackgroundTasks,
         audio: UploadFile = File(..., description="Audio file of Quran recitation"),
-        expected_arabic: str = Form(..., description="Expected Arabic text")
+        expected_arabic: str = Form(..., description="Expected Arabic text"),
+        api_key: str = Depends(verify_api_key)
 ):
     """
     Comprehensive Quran recitation analysis
@@ -195,9 +300,11 @@ async def analyze_recitation(
     5. Generate child-friendly AI feedback
 
     **Returns:** Complete analysis with mistakes, Tajweed guidance, and score
+
+    **Rate Limit:** 5 requests per minute
     """
 
-    logger.info(f"Analysis request received for: {expected_arabic[:50]}...")
+    logger.info(f"Analysis request from {request.client.host} for: {expected_arabic[:50]}...")
 
     # Validate inputs
     validate_audio_file(audio)
@@ -260,7 +367,7 @@ async def analyze_recitation(
 
         # Calculate score (0-100)
         score = max(0, min(100, int((1 - wer_value) * 100)))
-        needs_repeat = wer_value > 0.20  # >20% error rate
+        needs_repeat = wer_value > settings.WER_THRESHOLD
 
         # Schedule cleanup
         background_tasks.add_task(cleanup_temp_file, temp_file_path)
@@ -297,28 +404,48 @@ async def analyze_recitation(
 
 
 @app.post("/tajweed-guide", response_model=TajweedGuideResponse)
+@limiter.limit(RateLimitConfig.GENERAL)
 async def get_tajweed_guide(
-        arabic_text: str = Form(..., description="Arabic text for Tajweed analysis")
+        request: Request,
+        arabic_text: str = Form(..., description="Arabic text for Tajweed analysis"),
+        api_key: str = Depends(verify_api_key)
 ):
     """
     Get comprehensive Tajweed pronunciation guide for Arabic text
 
     **Returns:** Detailed Tajweed rules, difficulty level, and guidance
+
+    **Rate Limit:** 10 requests per minute
+
+    **Caching:** Results are cached for 1 hour
     """
 
     validate_arabic_text(arabic_text)
+
+    # Check cache first
+    cache_key = hash(arabic_text)
+    if tajweed_cache and cache_key in tajweed_cache:
+        logger.info("Returning cached Tajweed guide")
+        return tajweed_cache[cache_key]
 
     try:
         analyzer = TajweedAnalyzer()
         guide = analyzer.get_pronunciation_guide(arabic_text)
 
-        return {
+        result = {
             "ok": True,
             "text": arabic_text,
             "rules": guide['rules'],
             "difficulty_level": guide['difficulty_level'],
             "estimated_duration": guide['estimated_duration']
         }
+
+        # Cache the result
+        if tajweed_cache is not None:
+            tajweed_cache[cache_key] = result
+            logger.info(f"Cached Tajweed guide (cache size: {len(tajweed_cache)})")
+
+        return result
 
     except Exception as e:
         logger.exception(f"Tajweed guide generation failed: {str(e)}")
@@ -329,10 +456,13 @@ async def get_tajweed_guide(
 
 
 @app.get("/recitation", response_model=RecitationURLResponse)
+@limiter.limit(RateLimitConfig.GENERAL)
 async def get_recitation_url(
+        request: Request,
         surah: int = Query(..., ge=1, le=114, description="Surah number (1-114)"),
         ayah: int = Query(..., ge=1, description="Ayah number"),
-        reciter_id: int = Query(7, ge=1, description="Reciter ID")
+        reciter_id: int = Query(7, ge=1, description="Reciter ID"),
+        api_key: str = Depends(verify_api_key)
 ):
     """
     Get MP3 URL for a specific Surah and Ayah recitation
@@ -341,7 +471,14 @@ async def get_recitation_url(
     - 1: Abdul Basit
     - 2: Mishary Rashid Alafasy
     - 7: Abu Bakr Al-Shatiri (default)
+
+    **Rate Limit:** 10 requests per minute
     """
+
+    # Validate surah and ayah
+    is_valid, error_msg = validate_surah_ayah(surah, ayah)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
 
     try:
         url = build_reciter_url(surah, ayah, reciter_id)
@@ -349,7 +486,9 @@ async def get_recitation_url(
         reciter_names = {
             1: "Abdul Basit",
             2: "Mishary Rashid Alafasy",
-            7: "Abu Bakr Al-Shatiri"
+            7: "Abu Bakr Al-Shatiri",
+            3: "Mahmoud Khalil Al-Hussary",
+            4: "Saad Al-Ghamadi"
         }
 
         return {
@@ -368,34 +507,142 @@ async def get_recitation_url(
         )
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
+@app.post("/validate-ayah", response_model=ValidationResponse)
+@limiter.limit(RateLimitConfig.GENERAL)
+async def validate_ayah_endpoint(
+        request: Request,
+        data: ValidationRequest,
+        api_key: str = Depends(verify_api_key)
+):
+    """
+    Validate surah/ayah numbers
+
+    Useful for frontend validation before recording/analysis
+
+    **Rate Limit:** 10 requests per minute
+    """
+    is_valid, error_msg = validate_surah_ayah(data.surah, data.ayah)
+    max_ayah = get_max_ayah(data.surah)
+
     return {
+        "ok": True,
+        "valid": is_valid,
+        "message": error_msg,
+        "max_ayah": max_ayah
+    }
+
+
+@app.get("/health", response_model=HealthCheckResponse)
+async def health_check():
+    """
+    Health check endpoint with dependency status
+
+    Returns service health and status of critical dependencies
+    """
+    health = {
         "status": "healthy",
         "service": "quran-learning-api",
-        "version": "2.0.0"
+        "version": "2.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "checks": {}
     }
+
+    # Check Whisper model
+    try:
+        from asr import get_whisper_model
+        model = get_whisper_model()
+        health["checks"]["whisper"] = {
+            "status": "ok",
+            "model": settings.WHISPER_MODEL,
+            "device": settings.WHISPER_DEVICE
+        }
+    except Exception as e:
+        health["checks"]["whisper"] = {
+            "status": "error",
+            "error": str(e)
+        }
+        health["status"] = "degraded"
+
+    # Check Gemini
+    if settings.GEMINI_API_KEY:
+        health["checks"]["gemini"] = {
+            "status": "configured",
+            "model": settings.GEMINI_MODEL
+        }
+    else:
+        health["checks"]["gemini"] = {
+            "status": "disabled",
+            "note": "Using fallback feedback"
+        }
+
+    # Check cache
+    if tajweed_cache is not None:
+        health["checks"]["cache"] = {
+            "status": "enabled",
+            "items": len(tajweed_cache),
+            "max_size": settings.CACHE_MAX_SIZE,
+            "ttl": settings.CACHE_TTL_SECONDS
+        }
+    else:
+        health["checks"]["cache"] = {
+            "status": "disabled"
+        }
+
+    # Check rate limiter
+    health["checks"]["rate_limiter"] = {
+        "status": "enabled",
+        "general_limit": settings.RATE_LIMIT_PER_MINUTE,
+        "analyze_limit": settings.RATE_LIMIT_ANALYZE
+    }
+
+    return health
 
 
 @app.get("/")
 async def root():
-    """API information"""
+    """API information and links"""
     return {
-        "message": "Quran Learning API",
+        "message": "LittleBeliever Quran Learning API",
         "version": "2.0.0",
-        "docs": "/docs",
-        "health": "/health"
+        "description": "AI-powered Quran recitation analysis with Tajweed guidance",
+        "endpoints": {
+            "docs": "/docs",
+            "redoc": "/redoc",
+            "health": "/health",
+            "analyze": "POST /analyze",
+            "tajweed_guide": "POST /tajweed-guide",
+            "recitation": "GET /recitation",
+            "validate": "POST /validate-ayah"
+        },
+        "features": [
+            "Arabic Speech Recognition (Whisper)",
+            "Tajweed Rule Analysis",
+            "Child-Friendly AI Feedback",
+            "Rate Limiting",
+            "Response Caching",
+            "Request Logging"
+        ]
     }
 
+
+# ============ Run Server ============
 
 if __name__ == "__main__":
     import uvicorn
 
+    logger.info("=" * 60)
+    logger.info("Starting LittleBeliever Quran Learning API")
+    logger.info(f"Version: 2.0.0")
+    logger.info(f"Log Level: {settings.LOG_LEVEL}")
+    logger.info(f"Whisper Model: {settings.WHISPER_MODEL}")
+    logger.info(f"Cache Enabled: {settings.CACHE_ENABLED}")
+    logger.info(f"API Key Required: {settings.REQUIRE_API_KEY}")
+    logger.info("=" * 60)
+
     uvicorn.run(
-        app,
+        "app:app",  # Changed from just 'app' to "app:app"
         host="0.0.0.0",
         port=8081,
         reload=True,
-        log_level="info"
+        log_level=settings.LOG_LEVEL.lower()
     )
