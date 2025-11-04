@@ -10,3 +10,13 @@ venv/
 # IDE files
 .idea/
 .vscode/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+quran.db
+
+# Alembic
+alembic.ini
+migrations/versions/*.pyc

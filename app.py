@@ -34,12 +34,26 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from align import tokenize_arabic, wer_and_alignment
 from asr import transcribe_audio
+from audio_manager import get_audio_url, get_all_reciters, get_reciter_by_id
 from config import settings
+from database import init_db, get_db, User, Progress, Bookmark
+from exceptions import QuranAPIException, ResourceNotFoundException
 from feedback import generate_kid_feedback
 from quran_data import validate_surah_ayah, get_max_ayah
+from quran_metadata import (
+    get_all_surahs, get_surah_by_id, get_all_juz,
+    get_juz_by_id, get_surahs_by_juz
+)
 from reciters import build_reciter_url
 from rules import TajweedAnalyzer, detect_tajweed_hints
 from security import verify_api_key, RateLimitConfig
+from sqlalchemy.orm import Session
+from users import (
+    UserRegistration, UserLogin, UserProfile, UserPreferences,
+    TokenResponse, TokenRefresh, register_user, authenticate_user,
+    create_access_token, create_refresh_token, decode_token,
+    get_current_user, update_user_preferences
+)
 
 # Configure logging
 logging.basicConfig(
@@ -96,6 +110,14 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Add custom middleware
 app.add_middleware(RequestLoggingMiddleware)
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database and other startup tasks"""
+    logger.info("Initializing database...")
+    init_db()
+    logger.info("Database initialized successfully")
 
 # CORS Configuration
 origins = [
@@ -211,6 +233,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             "ok": False,
             "error": exc.detail,
             "status_code": exc.status_code,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+
+@app.exception_handler(QuranAPIException)
+async def quran_api_exception_handler(request: Request, exc: QuranAPIException):
+    """Handle custom API exceptions"""
+    logger.error(f"API exception on {request.url.path}: {exc.message}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "ok": False,
+            "error": exc.message,
             "timestamp": datetime.utcnow().isoformat()
         }
     )
@@ -598,6 +634,525 @@ async def health_check():
     return health
 
 
+# ============ Quran Data Endpoints ============
+
+@app.get("/api/surahs")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_surahs(request: Request):
+    """
+    Get all surahs with complete metadata
+    
+    Returns list of all 114 surahs with:
+    - ID, name (English & Arabic)
+    - Ayah count
+    - Juz number
+    - Revelation place (Makkah/Madinah)
+    """
+    try:
+        surahs = get_all_surahs()
+        return {
+            "ok": True,
+            "count": len(surahs),
+            "surahs": surahs
+        }
+    except Exception as e:
+        logger.exception(f"Failed to fetch surahs: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch surah data")
+
+
+@app.get("/api/surahs/{surah_id}")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_surah(request: Request, surah_id: int):
+    """Get specific surah details by ID"""
+    surah = get_surah_by_id(surah_id)
+    if not surah:
+        raise HTTPException(status_code=404, detail=f"Surah {surah_id} not found")
+    
+    return {
+        "ok": True,
+        "surah": surah
+    }
+
+
+@app.get("/api/juz")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_all_juz_endpoint(request: Request):
+    """
+    Get all Juz' (30 parts) with start/end surah and ayah information
+    """
+    try:
+        juz_list = get_all_juz()
+        return {
+            "ok": True,
+            "count": len(juz_list),
+            "juz": juz_list
+        }
+    except Exception as e:
+        logger.exception(f"Failed to fetch juz data: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch juz data")
+
+
+@app.get("/api/juz/{juz_id}")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_juz(request: Request, juz_id: int):
+    """Get specific Juz details including surahs it contains"""
+    juz = get_juz_by_id(juz_id)
+    if not juz:
+        raise HTTPException(status_code=404, detail=f"Juz {juz_id} not found")
+    
+    # Get surahs in this juz
+    surahs = get_surahs_by_juz(juz_id)
+    
+    return {
+        "ok": True,
+        "juz": juz,
+        "surahs": surahs
+    }
+
+
+# ============ Reciter & Audio Endpoints ============
+
+@app.get("/api/reciters")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_reciters(request: Request):
+    """Get all available reciters with their information"""
+    try:
+        reciters = get_all_reciters()
+        return {
+            "ok": True,
+            "count": len(reciters),
+            "reciters": reciters
+        }
+    except Exception as e:
+        logger.exception(f"Failed to fetch reciters: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch reciter data")
+
+
+@app.get("/api/reciters/{reciter_id}")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_reciter(request: Request, reciter_id: int):
+    """Get specific reciter details"""
+    reciter = get_reciter_by_id(reciter_id)
+    if not reciter:
+        raise HTTPException(status_code=404, detail=f"Reciter {reciter_id} not found")
+    
+    return {
+        "ok": True,
+        "reciter": reciter
+    }
+
+
+@app.get("/api/audio/{reciter_id}/surah/{surah_id}/ayah/{ayah_number}")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_audio(
+    request: Request,
+    reciter_id: int,
+    surah_id: int,
+    ayah_number: int
+):
+    """
+    Get audio URL for specific recitation
+    
+    Returns direct MP3 URL from CDN
+    """
+    # Validate surah and ayah
+    is_valid, error_msg = validate_surah_ayah(surah_id, ayah_number)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+    
+    try:
+        url = get_audio_url(reciter_id, surah_id, ayah_number)
+        reciter = get_reciter_by_id(reciter_id)
+        
+        return {
+            "ok": True,
+            "url": url,
+            "reciter": reciter['name'] if reciter else "Unknown",
+            "surah": surah_id,
+            "ayah": ayah_number
+        }
+    except Exception as e:
+        logger.exception(f"Failed to generate audio URL: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate audio URL")
+
+
+# ============ Authentication Endpoints ============
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+@limiter.limit(RateLimitConfig.GENERAL)
+async def register(
+    request: Request,
+    registration: UserRegistration,
+    db: Session = Depends(get_db)
+):
+    """
+    Register a new user
+    
+    Returns JWT access and refresh tokens
+    """
+    try:
+        user = register_user(db, registration)
+        
+        # Generate tokens
+        access_token = create_access_token(user.id, user.username)
+        refresh_token = create_refresh_token(user.id, user.username)
+        
+        logger.info(f"New user registered: {user.username}")
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": settings.JWT_ACCESS_TOKEN_EXPIRES
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Registration failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Registration failed")
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+@limiter.limit(RateLimitConfig.GENERAL)
+async def login(
+    request: Request,
+    credentials: UserLogin,
+    db: Session = Depends(get_db)
+):
+    """
+    Login with username and password
+    
+    Returns JWT access and refresh tokens
+    """
+    try:
+        user = authenticate_user(db, credentials)
+        
+        # Generate tokens
+        access_token = create_access_token(user.id, user.username)
+        refresh_token = create_refresh_token(user.id, user.username)
+        
+        logger.info(f"User logged in: {user.username}")
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": settings.JWT_ACCESS_TOKEN_EXPIRES
+        }
+    except Exception as e:
+        logger.exception(f"Login failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@app.post("/api/auth/refresh", response_model=TokenResponse)
+@limiter.limit(RateLimitConfig.GENERAL)
+async def refresh_token(
+    request: Request,
+    token_data: TokenRefresh
+):
+    """
+    Refresh access token using refresh token
+    """
+    try:
+        payload = decode_token(token_data.refresh_token)
+        
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=400, detail="Invalid token type")
+        
+        user_id = payload.get("user_id")
+        username = payload.get("username")
+        
+        # Generate new tokens
+        access_token = create_access_token(user_id, username)
+        refresh_token = create_refresh_token(user_id, username)
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": settings.JWT_ACCESS_TOKEN_EXPIRES
+        }
+    except Exception as e:
+        logger.exception(f"Token refresh failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Token refresh failed")
+
+
+# ============ User Profile Endpoints ============
+
+@app.get("/api/users/{user_id}", response_model=UserProfile)
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_user_profile(
+    request: Request,
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get user profile (requires authentication)"""
+    # Users can only access their own profile
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    return current_user
+
+
+@app.put("/api/users/{user_id}/preferences")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def update_preferences(
+    request: Request,
+    user_id: int,
+    preferences: UserPreferences,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update user preferences"""
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        updated_user = update_user_preferences(db, current_user, preferences)
+        return {
+            "ok": True,
+            "message": "Preferences updated successfully",
+            "preferences": updated_user.preferences
+        }
+    except Exception as e:
+        logger.exception(f"Failed to update preferences: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update preferences")
+
+
+# ============ Progress Tracking Endpoints ============
+
+@app.post("/api/progress")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def save_progress(
+    request: Request,
+    surah_id: int = Query(..., ge=1, le=114),
+    verse_number: int = Query(..., ge=1),
+    completed: bool = Query(False),
+    memorized: bool = Query(False),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Save user progress for a specific verse"""
+    try:
+        # Validate verse
+        is_valid, error_msg = validate_surah_ayah(surah_id, verse_number)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        # Check if progress record exists
+        progress = db.query(Progress).filter(
+            Progress.user_id == current_user.id,
+            Progress.surah_id == surah_id
+        ).first()
+        
+        if not progress:
+            # Create new progress record
+            progress = Progress(
+                user_id=current_user.id,
+                surah_id=surah_id,
+                completed_verses=[],
+                memorized_verses=[]
+            )
+            db.add(progress)
+        
+        # Update lists
+        completed_list = progress.completed_verses or []
+        memorized_list = progress.memorized_verses or []
+        
+        if completed and verse_number not in completed_list:
+            completed_list.append(verse_number)
+        if memorized and verse_number not in memorized_list:
+            memorized_list.append(verse_number)
+        
+        progress.completed_verses = completed_list
+        progress.memorized_verses = memorized_list
+        progress.last_read_verse = verse_number
+        progress.last_read_time = datetime.utcnow()
+        
+        db.commit()
+        
+        return {
+            "ok": True,
+            "message": "Progress saved successfully",
+            "surah_id": surah_id,
+            "verse_number": verse_number
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to save progress: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to save progress")
+
+
+@app.get("/api/progress/{user_id}")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_progress(
+    request: Request,
+    user_id: int,
+    surah_id: Optional[int] = Query(None, ge=1, le=114),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get user progress, optionally filtered by surah"""
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        query = db.query(Progress).filter(Progress.user_id == user_id)
+        if surah_id:
+            query = query.filter(Progress.surah_id == surah_id)
+        
+        progress_list = query.all()
+        
+        return {
+            "ok": True,
+            "count": len(progress_list),
+            "progress": [
+                {
+                    "surah_id": p.surah_id,
+                    "completed_verses": p.completed_verses or [],
+                    "memorized_verses": p.memorized_verses or [],
+                    "last_read_verse": p.last_read_verse,
+                    "last_read_time": p.last_read_time.isoformat() if p.last_read_time else None
+                }
+                for p in progress_list
+            ]
+        }
+    except Exception as e:
+        logger.exception(f"Failed to fetch progress: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch progress")
+
+
+# ============ Bookmark Endpoints ============
+
+@app.post("/api/bookmarks")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def create_bookmark(
+    request: Request,
+    surah_id: int = Query(..., ge=1, le=114),
+    verse_index: int = Query(..., ge=1),
+    note: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create a new bookmark"""
+    try:
+        # Validate verse
+        is_valid, error_msg = validate_surah_ayah(surah_id, verse_index)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        # Check if bookmark already exists
+        existing = db.query(Bookmark).filter(
+            Bookmark.user_id == current_user.id,
+            Bookmark.surah_id == surah_id,
+            Bookmark.verse_index == verse_index
+        ).first()
+        
+        if existing:
+            raise HTTPException(status_code=400, detail="Bookmark already exists")
+        
+        # Create bookmark
+        bookmark = Bookmark(
+            user_id=current_user.id,
+            surah_id=surah_id,
+            verse_index=verse_index,
+            note=note
+        )
+        db.add(bookmark)
+        db.commit()
+        db.refresh(bookmark)
+        
+        return {
+            "ok": True,
+            "message": "Bookmark created successfully",
+            "bookmark": {
+                "id": bookmark.id,
+                "surah_id": bookmark.surah_id,
+                "verse_index": bookmark.verse_index,
+                "note": bookmark.note,
+                "created_at": bookmark.created_at.isoformat()
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to create bookmark: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to create bookmark")
+
+
+@app.get("/api/bookmarks/{user_id}")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def get_bookmarks(
+    request: Request,
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all bookmarks for a user"""
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    try:
+        bookmarks = db.query(Bookmark).filter(
+            Bookmark.user_id == user_id
+        ).order_by(Bookmark.created_at.desc()).all()
+        
+        return {
+            "ok": True,
+            "count": len(bookmarks),
+            "bookmarks": [
+                {
+                    "id": b.id,
+                    "surah_id": b.surah_id,
+                    "verse_index": b.verse_index,
+                    "note": b.note,
+                    "created_at": b.created_at.isoformat()
+                }
+                for b in bookmarks
+            ]
+        }
+    except Exception as e:
+        logger.exception(f"Failed to fetch bookmarks: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch bookmarks")
+
+
+@app.delete("/api/bookmarks/{bookmark_id}")
+@limiter.limit(RateLimitConfig.GENERAL)
+async def delete_bookmark(
+    request: Request,
+    bookmark_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete a bookmark"""
+    try:
+        bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
+        
+        if not bookmark:
+            raise HTTPException(status_code=404, detail="Bookmark not found")
+        
+        if bookmark.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+        
+        db.delete(bookmark)
+        db.commit()
+        
+        return {
+            "ok": True,
+            "message": "Bookmark deleted successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to delete bookmark: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to delete bookmark")
+
+
 @app.get("/")
 async def root():
     """API information and links"""
@@ -612,12 +1167,22 @@ async def root():
             "analyze": "POST /analyze",
             "tajweed_guide": "POST /tajweed-guide",
             "recitation": "GET /recitation",
-            "validate": "POST /validate-ayah"
+            "validate": "POST /validate-ayah",
+            "surahs": "GET /api/surahs",
+            "juz": "GET /api/juz",
+            "reciters": "GET /api/reciters",
+            "auth": "POST /api/auth/register, /api/auth/login",
+            "progress": "POST /api/progress, GET /api/progress/{user_id}",
+            "bookmarks": "POST /api/bookmarks, GET /api/bookmarks/{user_id}"
         },
         "features": [
             "Arabic Speech Recognition (Whisper)",
             "Tajweed Rule Analysis",
             "Child-Friendly AI Feedback",
+            "User Management & JWT Authentication",
+            "Progress Tracking",
+            "Bookmarks",
+            "Complete Quran Metadata API",
             "Rate Limiting",
             "Response Caching",
             "Request Logging"
