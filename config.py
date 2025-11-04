@@ -46,6 +46,25 @@ class Settings(BaseSettings):
     ENABLE_METRICS: bool = True
     LOG_LEVEL: str = "INFO"
 
+    # Database
+    DATABASE_URL: str = "sqlite:///./quran.db"
+
+    # JWT Authentication
+    JWT_SECRET_KEY: str = "your-secret-key-change-in-production"
+    JWT_ACCESS_TOKEN_EXPIRES: int = 3600  # 1 hour
+    JWT_REFRESH_TOKEN_EXPIRES: int = 604800  # 7 days
+
+    # API Settings
+    API_VERSION: str = "v1"
+    API_PREFIX: str = "/api"
+
+    # Audio CDN
+    AUDIO_CDN_BASE_URL: str = "https://cdn.islamic.network/quran/audio"
+
+    # Pagination
+    DEFAULT_PAGE_SIZE: int = 20
+    MAX_PAGE_SIZE: int = 100
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
